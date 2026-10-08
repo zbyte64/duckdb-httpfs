@@ -286,6 +286,39 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRequest(HTTPFileHandle &hfh, stri
 	return response;
 }
 
+//! Parses the byte span `<first>-<last>` of a `Content-Range: bytes <first>-<last>/<total>` response header
+//! (RFC 7233 §4.2) and returns its length. Returns an unset index when the header is absent or malformed.
+static optional_idx TryParseContentRangeSpan(const HTTPResponse &response) {
+	if (!response.HasHeader("Content-Range")) {
+		return {};
+	}
+	const auto content_range = response.GetHeaderValue("Content-Range");
+	const auto unit_separator = content_range.find(' ');
+	if (unit_separator == string::npos || unit_separator + 1 >= content_range.size()) {
+		return {};
+	}
+	const auto range_value = content_range.substr(unit_separator + 1);
+	const auto slash = range_value.find('/');
+	if (slash == string::npos) {
+		return {};
+	}
+	const auto byte_range = range_value.substr(0, slash);
+	const auto dash = byte_range.find('-');
+	if (dash == string::npos || dash == 0 || dash + 1 >= byte_range.size()) {
+		return {};
+	}
+	try {
+		const auto first = std::stoull(byte_range.substr(0, dash));
+		const auto last = std::stoull(byte_range.substr(dash + 1));
+		if (last < first) {
+			return {};
+		}
+		return NumericCast<idx_t>(last - first + 1);
+	} catch (const std::exception &) {
+		return {};
+	}
+}
+
 unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh, string url, HTTPHeaders header_map,
                                                             HTTPFSParams &http_params, const string &etag,
                                                             bool auto_fallback_to_full_file_download, idx_t file_offset,
@@ -342,6 +375,16 @@ unique_ptr<HTTPResponse> HTTPFileSystem::RunGetRangeRequest(HTTPFileHandle &hfh,
 					    // Content-Length header contains a non-numeric value, so skip validation.
 				    }
 				    if (parsed && (idx_t)content_length != buffer_out_len) {
+					    RangeRequestNotSupportedException::Throw();
+				    }
+			    }
+			    // A 206 response must carry a Content-Range header whose span matches the request
+			    // (RFC 7233 §4.1). A server that omits it or reports a different span did not honor
+			    // the Range header; fall back to a full download instead of overflowing the buffer.
+			    // A transfer that failed mid-body surfaces here without headers; leave it to the retry logic.
+			    if (response.status == HTTPStatusCode::PartialContent_206 && !response.HasRequestError()) {
+				    auto range_span = TryParseContentRangeSpan(response);
+				    if (!range_span.IsValid() || range_span.GetIndex() != buffer_out_len) {
 					    RangeRequestNotSupportedException::Throw();
 				    }
 			    }
@@ -864,7 +907,8 @@ void HTTPFileHandle::FullDownload(HTTPFileSystem &hfs, bool &should_write_cache)
 	if (!cached_file_handle->Initialized()) {
 		// Try to fully download the file first
 		const auto full_download_result = hfs.GetRequest(*this, path, {});
-		if (full_download_result->status != HTTPStatusCode::OK_200) {
+		if (full_download_result->status != HTTPStatusCode::OK_200 &&
+		    full_download_result->status != HTTPStatusCode::PartialContent_206) {
 			throw HTTPException(*full_download_result, "Full download failed to to URL \"%s\": %d (%s)",
 			                    full_download_result->url, static_cast<int>(full_download_result->status),
 			                    full_download_result->GetError());
